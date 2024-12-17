@@ -8,7 +8,7 @@ from .tcned import TcnED
 from .anomalytransformer import AnomalyTransformer
 from .timesnet import TimesNet
 from .dcdetector import DCdetector
-
+from .gsvdd import GDeepSVDDTS
 # weakly-supervised
 from .dsad import DeepSADTS
 from .devnet import DevNetTS
@@ -16,4 +16,4 @@ from .prenet import PReNetTS
 
 
 __all__ = ['DeepIsolationForestTS', 'DeepSVDDTS', 'TranAD', 'USAD', 'COUTA',
-           'DeepSADTS', 'DevNetTS', 'PReNetTS', 'AnomalyTransformer', 'TimesNet', 'DCdetector']
+           'DeepSADTS', 'DevNetTS', 'PReNetTS', 'AnomalyTransformer', 'TimesNet', 'DCdetector','GDeepSVDDTS']

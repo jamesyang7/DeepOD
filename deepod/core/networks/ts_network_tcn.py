@@ -1,16 +1,24 @@
 # TCN is partially adapted from https://github.com/locuslab/TCN
-
+from sklearn.covariance import MinCovDet
 import torch
+import torch.nn as nn
 from torch.nn.utils import weight_norm
 from deepod.core.networks.network_utility import _instantiate_class, _handle_n_hidden
-
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class TcnAE(torch.nn.Module):
     """Temporal Convolutional Network-based AutoEncoder"""
     def __init__(self, n_features, n_hidden='500,100', n_emb=20, activation='ReLU', bias=False,
-                 kernel_size=2, dropout=0.2):
+                 kernel_size=2, dropout=0.2,n_output=20, confidence=0.95, reg_const=1e-4, is_train=1):
         super(TcnAE, self).__init__()
 
+        self.confidence = confidence
+        self.reg_const = reg_const
+        self.is_train = is_train
+        self.mu = torch.zeros(n_output, requires_grad=False)
+        self.sigma_inv = torch.eye(n_output, requires_grad=False)
+        self.radius = nn.Parameter(torch.ones(1))
+        
         if type(n_hidden) == int:
             n_hidden = [n_hidden]
         if type(n_hidden) == str:
@@ -19,23 +27,119 @@ class TcnAE(torch.nn.Module):
         num_layers = len(n_hidden)
 
         encoder_layers = []
+
         # encoder
         for i in range(num_layers+1):
             dilation_size = 2 ** i
             padding_size = (kernel_size-1) * dilation_size
             in_channels = n_features if i == 0 else n_hidden[i-1]
-            out_channels = n_emb if i == num_layers else n_hidden[i]
+            out_channels =512
             encoder_layers += [TcnResidualBlock(in_channels, out_channels, kernel_size,
                                                 stride=1, dilation=dilation_size,
                                                 padding=padding_size, dropout=dropout, bias=bias,
                                                 activation=activation)]
-
+            
+        self.l1 = torch.nn.Linear(512, n_output, bias=bias)
         # decoder
         decoder_n_hidden = n_hidden[::-1]
         decoder_layers = []
         for i in range(num_layers+1):
             # no dilation in decoder
-            in_channels = n_emb if i == 0 else decoder_n_hidden[i-1]
+            in_channels = 512
+            out_channels = n_features if i==num_layers else decoder_n_hidden[i]
+            dilation_size = 2 ** (num_layers-i)
+            padding_size = (kernel_size-1) * dilation_size
+            decoder_layers += [TcnResidualBlockTranspose(in_channels, out_channels, kernel_size,
+                                                         stride=1, dilation=dilation_size,
+                                                         padding=padding_size, dropout=dropout, bias=bias,
+                                                         activation=activation)]
+
+        self.encoder = torch.nn.Sequential(*encoder_layers)
+        self.decoder = torch.nn.Sequential(*decoder_layers)
+
+    def forward(self, x,flag=1):
+        out = x.permute(0, 2, 1)
+        enc = self.encoder(out)
+        rep = enc.permute(0,2,1)[:,-1]
+        rep = self.l1(rep)
+        if self.is_train:
+            self.mu, self.sigma_inv = self.update_mcd_parameters(rep)
+        distances = self.mahalanobis_distance(rep)
+        if flag:
+            radius = self.dynamic_radius(distances)
+            self.radius.data = torch.tensor([radius]).to(rep.device)
+        dec = self.decoder(enc)
+        return distances,self.radius,rep,dec.permute(0, 2, 1)
+    
+    def update_mcd_parameters(self, z_combined):
+        """
+        Update the mean and inverse covariance matrix using MCD.
+        :param z_combined: Combined feature vector (batch_size, feature_dim)
+        """
+        z_numpy = z_combined.detach().cpu().numpy()
+        mcd = MinCovDet().fit(z_numpy)
+        mcd_mean = torch.tensor(mcd.location_, device=z_combined.device, dtype=torch.float32)
+        mcd_cov = torch.tensor(mcd.covariance_, device=z_combined.device, dtype=torch.float32)
+        mcd_cov += self.reg_const * torch.eye(z_combined.size(1), device=z_combined.device)
+        mcd_inv_cov = torch.linalg.inv(mcd_cov)
+        return mcd_mean, mcd_inv_cov
+
+    def mahalanobis_distance(self, z):
+        """
+        Calculate Mahalanobis distance for each data point in the batch.
+        :param z: Feature vectors (batch_size, feature_dim)
+        :return: Mahalanobis distances (batch_size,)
+        """
+        diff = z - self.mu
+        dist = torch.sqrt(torch.sum(diff * (diff @ self.sigma_inv), dim=1))
+        return dist
+    
+    def dynamic_radius(self, distances):
+        """
+        Estimate dynamic radius for the Gaussian sphere based on confidence level.
+        :param distances: Mahalanobis distances for normal data points (batch_size,)
+        :return: Estimated radius (scalar)
+        """
+        radius = torch.quantile(distances, self.confidence)
+        return radius
+
+
+class TcnAE_ORIGINAL(torch.nn.Module):
+    """Temporal Convolutional Network-based AutoEncoder"""
+    def __init__(self, n_features, n_hidden='500,100', n_emb=20, activation='ReLU', bias=False,
+                 kernel_size=2, dropout=0.2,n_output=20, confidence=0.95, reg_const=1e-4, is_train=1):
+        super(TcnAE, self).__init__()
+        
+        self.confidence = confidence
+        self.reg_const = reg_const
+        self.is_train = is_train
+        if type(n_hidden) == int:
+            n_hidden = [n_hidden]
+        if type(n_hidden) == str:
+            n_hidden = n_hidden.split(',')
+            n_hidden = [int(a) for a in n_hidden]
+        num_layers = len(n_hidden)
+
+        encoder_layers = []
+
+        # encoder
+        for i in range(num_layers+1):
+            dilation_size = 2 ** i
+            padding_size = (kernel_size-1) * dilation_size
+            in_channels = n_features if i == 0 else n_hidden[i-1]
+            out_channels =512
+            encoder_layers += [TcnResidualBlock(in_channels, out_channels, kernel_size,
+                                                stride=1, dilation=dilation_size,
+                                                padding=padding_size, dropout=dropout, bias=bias,
+                                                activation=activation)]
+            
+        self.l1 = torch.nn.Linear(512, n_output, bias=bias)
+        # decoder
+        decoder_n_hidden = n_hidden[::-1]
+        decoder_layers = []
+        for i in range(num_layers+1):
+            # no dilation in decoder
+            in_channels = 512
             out_channels = n_features if i==num_layers else decoder_n_hidden[i]
             dilation_size = 2 ** (num_layers-i)
             padding_size = (kernel_size-1) * dilation_size
@@ -58,9 +162,10 @@ class TcnAE(torch.nn.Module):
     def forward(self, x):
         out = x.permute(0, 2, 1)
         enc = self.encoder(out)
+        rep = enc.permute(0,2,1)[:,-1]
+        rep = self.l1(rep)
         dec = self.decoder(enc)
-        return dec.permute(0, 2, 1), enc.permute(0, 2, 1)
-
+        return dec.permute(0, 2, 1), rep
 
 class TCNnet(torch.nn.Module):
     """Temporal Convolutional Network (TCN) for encoding/representing input time series sequences"""
@@ -94,7 +199,8 @@ class TCNnet(torch.nn.Module):
         self.l1 = torch.nn.Linear(n_hidden[-1], n_output, bias=bias)
 
     def forward(self, x):
-        out = self.network(x.transpose(2, 1)).transpose(2, 1)[:, -1]
+        out = self.network(x.transpose(2, 1)).transpose(2, 1)
+        out = out[:, -1]
         rep = self.l1(out)
         return rep
         # # x shape[bs, seq_len, embed]

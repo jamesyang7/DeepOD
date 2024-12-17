@@ -3,14 +3,15 @@
 One-class classification
 @Author: Hongzuo Xu <hongzuoxu@126.com, xuhongzuo13@nudt.edu.cn>
 """
-
-from deepod.core.base_model import BaseDeepAD
+from deepod.core.networks.ts_network_tcn import TCNnet, TcnAE
+from deepod.core.base_model_gsvdd import GDeepAD
 from deepod.core.networks.base_networks import get_network
 from torch.utils.data import DataLoader
 import torch
+import torch.nn as nn
 
 
-class DeepSVDDTS(BaseDeepAD):
+class GDeepSVDDTS(GDeepAD):
     """
     Deep One-class Classification for Anomaly Detection (ICML'18)
      :cite:`ruff2018deepsvdd`
@@ -94,7 +95,7 @@ class DeepSVDDTS(BaseDeepAD):
         Initializes the DeepSVDDTS model with the specified parameters.
         """
         
-        super(DeepSVDDTS, self).__init__(
+        super(GDeepSVDDTS, self).__init__(
             model_name='DeepSVDD', data_type='ts', epochs=epochs, batch_size=batch_size, lr=lr,
             network=network, seq_len=seq_len, stride=stride,
             epoch_steps=epoch_steps, prt_steps=prt_steps, device=device,
@@ -105,8 +106,6 @@ class DeepSVDDTS(BaseDeepAD):
         self.rep_dim = rep_dim
         self.act = act
         self.bias = bias
-
-        # parameters for Transformer
         self.n_heads = n_heads
         self.d_model = d_model
         self.attn = attn
@@ -159,18 +158,15 @@ class DeepSVDDTS(BaseDeepAD):
             network_params['seq_len'] = self.seq_len
         elif self.network == 'ConvSeq':
             network_params['seq_len'] = self.seq_len
-        print(network_params)
-        network_class = get_network(self.network)
-        net = network_class(**network_params).to(self.device)
-
-        # self.c = torch.randn(net.n_emb).to(self.device)
-        self.c = self._set_c(net, train_loader)
-        criterion = DSVDDLoss(c=self.c)
+        
+        # network_class = get_network(self.network)
+        network_class = TcnAE(n_features=self.n_features,n_hidden=512,n_output=32,activation=self.act,bias=self.bias)
+        net = network_class.to(self.device)
 
         if self.verbose >= 2:
             print(net)
 
-        return train_loader, net, criterion
+        return train_loader, net
 
     def inference_prepare(self, X):
         """
@@ -190,10 +186,9 @@ class DeepSVDDTS(BaseDeepAD):
         
         test_loader = DataLoader(X, batch_size=self.batch_size,
                                  drop_last=False, shuffle=False)
-        self.criterion.reduction = 'none'
         return test_loader
 
-    def training_forward(self, batch_x, net, criterion):
+    def training_forward(self, batch_x, net,flag):
         """
         Performs a forward pass during training.
 
@@ -216,11 +211,15 @@ class DeepSVDDTS(BaseDeepAD):
         """
         
         batch_x = batch_x.float().to(self.device)
-        z = net(batch_x)
-        loss = criterion(z)
+        distances,radius,rep,dec = net(batch_x,flag)
+        gaussian_loss = torch.mean(torch.relu(distances**2-radius**2))+radius**2
+        reconstruction_loss = nn.SmoothL1Loss()(batch_x,dec)
+        reg_loss = self.compute_entropy_and_covariance_loss(rep)*0.001
+        loss = gaussian_loss+reconstruction_loss+reg_loss
+        # print(torch.mean(distances).cpu().detach().numpy(),radius.cpu().detach().numpy())
         return loss
 
-    def inference_forward(self, batch_x, net, criterion):
+    def inference_forward(self, batch_x, net):
         """
         Performs a forward pass during inference.
 
@@ -243,105 +242,35 @@ class DeepSVDDTS(BaseDeepAD):
             s (torch.Tensor): 
                 The anomaly scores for the batch.
         """
-        
+        net.is_train=0
         batch_x = batch_x.float().to(self.device)
-        batch_z = net(batch_x)
-        s = criterion(batch_z)
-        return batch_z, s
-
-    def _set_c(self, net, dataloader, eps=0.1):
-        """
-        Initializes the center 'c' for the hypersphere in the representation space.
-
-        Args:
-        
-            net (nn.Module): 
-                The neural network model.
-            
-            dataloader (DataLoader): 
-                DataLoader for the data to compute the center from.
-            
-            eps (float, optional):
-                Small value to ensure 'c' is away from zero. Default is 0.1.
-
-        Returns:
-        
-            c (torch.Tensor):  
-                The initialized center of the hypersphere.
-            
-        """
-        
-        net.eval()
-        z_ = []
-        with torch.no_grad():
-            for x in dataloader:
-                x = x.float().to(self.device)
-                z = net(x)
-                z_.append(z.detach())
-        z_ = torch.cat(z_)
-        c = torch.mean(z_, dim=0)
-        c[(abs(c) < eps) & (c < 0)] = -eps
-        c[(abs(c) < eps) & (c > 0)] = eps
-        return c
-
-
-class DSVDDLoss(torch.nn.Module):
-    """
-
-    Custom loss function for Deep Support Vector Data Description (Deep SVDD).
+        distances,radius,rep,dec = net(batch_x)
+        loss = distances
+        return rep, loss
     
-    This loss function computes the distance between each data point in the representation
-    space and the center of the hypersphere and aims to minimize this distance for normal data points.
-
-    Args:
+    def compute_entropy_and_covariance_loss(self, z):
+        """
+        Compute both the entropy loss and the covariance regularization loss.
+        Includes a diagonal penalty term to prevent small diagonal entries.
+        """
+        # Calculate covariance matrix
+        cov_matrix = torch.cov(z.T)
+        
+        cov_matrix += 1e-3 * torch.eye(cov_matrix.size(0)).to(cov_matrix.device)
+        
+        diagonal_entries = torch.diag(cov_matrix)
+        diagonal_penalty = torch.sum(1.0 / (diagonal_entries + 1e-6))  # Avoid division by zero
+        eigenvalues = torch.linalg.eigvalsh(cov_matrix)
+        max_eigenvalue = torch.max(eigenvalues)
+        min_eigenvalue = torch.min(eigenvalues)
+        epsilon = 1e-6  # To avoid division by zero
+        condition_number_penalty = (max_eigenvalue / (min_eigenvalue + epsilon))
+        
+        # Combine the losses with weights (tunable hyperparameters)
+        diagonal_weight = 1
+        condition_weight = 1
+        total_loss = diagonal_weight * diagonal_penalty +condition_number_penalty
     
-        c (torch.Tensor):
-            The center of the hypersphere in the representation space.
-            
-        reduction (str, optional): 
-            Specifies the reduction to apply to the output. Choices are 'none', 'mean', 'sum'. Default is 'mean'.
-                - If ``'none'``: no reduction will be applied;
-                - If ``'mean'``: the sum of the output will be divided by the number of elements in the output;
-                - If ``'sum'``: the output will be summed
-
-    """
-    
-    def __init__(self, c, reduction='mean'):
-        """
-        Initializes the DSVDDLoss with the hypersphere center and reduction method.
-        """
         
-        super(DSVDDLoss, self).__init__()
-        self.c = c
-        self.reduction = reduction
-
-    def forward(self, rep, reduction=None):
-        """
-        Calculates the Deep SVDD loss for a batch of representations.
-
-        Args:
-        
-            rep (torch.Tensor): 
-                The representation of the batch of data.
-            
-            reduction (str, optional): 
-                The reduction method to apply. If None, will use the specified 'reduction' attribute. Default is None.
-
-        Returns:
-        
-            loss (torch.Tensor): 
-                The calculated loss based on the representations and the center 'c'.
-                
-        """
-        
-        loss = torch.sum((rep - self.c) ** 2, dim=1)
-
-        if reduction is None:
-            reduction = self.reduction
-
-        if reduction == 'mean':
-            return torch.mean(loss)
-        elif reduction == 'sum':
-            return torch.sum(loss)
-        elif reduction == 'none':
-            return loss
+        return total_loss
+ 
