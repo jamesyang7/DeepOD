@@ -9,7 +9,8 @@ from deepod.core.networks.base_networks import get_network
 from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
-
+import warnings
+warnings.filterwarnings("ignore")
 
 class GDeepSVDDTS(GDeepAD):
     """
